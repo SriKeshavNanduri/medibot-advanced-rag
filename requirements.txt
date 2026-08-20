@@ -1,0 +1,23 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+anyio
+
+# --- Auth ---
+pyjwt
+passlib[bcrypt]
+
+# --- Database ---
+psycopg[binary]
+SQLAlchemy
+
+# --- LangChain & Vector DB ---
+langchain
+langchain-google-genai
+langchain-qdrant
+qdrant-client
+langchain-community
+langchain-classic
+semantic-router
+sentence-transformers

@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastapi-rag"
+version = "0.1.0"
+description = "FastAPI RAG application with advanced retrieval, chunking, and RBAC"
+readme = "Medibot_Assignment_Instruction.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: FastAPI",
+]
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.22.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "anyio>=3.7.0",
+    "python-multipart>=0.0.6",
+    "fastembed>=0.5.0",
+
+    # --- Auth ---
+    "pyjwt>=2.8.0",
+    "passlib[bcrypt]>=1.7.4",
+    
+    # --- Database ---
+    "psycopg2-binary>=2.9.9",
+    "SQLAlchemy>=2.0.0",
+    
+    # --- LangChain & Vector DB ---
+    "langchain>=0.1.0",
+    "langchain-google-genai>=0.0.5",
+    "langchain-qdrant>=0.0.1",
+    "qdrant-client>=1.7.0",
+    "langchain-community>=0.0.10",
+    "langchain-classic>=0.0.1",
+    "semantic-router>=0.0.51",
+    "sentence-transformers>=2.2.2",
+    
+    # --- Additional packages imported in codebase ---
+    "docling>=1.0.0",
+    "docling-core>=1.0.0",
+    "transformers>=4.30.0",
+    "tiktoken>=0.5.0",
+    "guardrails-ai>=0.4.0",
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    "requests>=2.31.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["api*"]
+exclude = ["mediassist_data*"]
