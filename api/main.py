@@ -46,6 +46,13 @@ from api.models import (
 )
 from api.rbac import get_collections_for_role
 
+import torch
+torch._dynamo.config.suppress_errors = True
+
+from dotenv import load_dotenv
+load_dotenv("creds.env")
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
@@ -161,6 +168,7 @@ def login(payload: LoginRequest) -> LoginResponse:
     
     Raises:
         HTTPException: If authentication fails due to invalid credentials."""
+    
     role = authenticate(payload.username, payload.password)
     if role is None:
         # Identical message for unknown user and wrong password.
@@ -246,23 +254,11 @@ async def ingestion(
             temp_file.write(await file.read())
 
         result = chunking_service._process_single_file(temp_path, collection_name)
-        if result["status"] != "success":
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=result.get("error") or "Ingestion failed for the uploaded file.",
-            )
 
-        return {
-            "status": "success",
-            "file": filename,
-            "collection": collection_name,
-            "chunks_created": result["num_chunks"],
-            "skipped_chunks": result.get("skipped_chunks", 0),
-            "elapsed_seconds": result.get("elapsed_seconds"),
-        }
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+        return result
+
+    except Exception as e:
+        return result 
 
 
 @app.post(

@@ -1,22 +1,30 @@
 # import statements
 
-import os
+from tracemalloc import start
 
 from docling.document_converter import DocumentConverter
-
-
 from dotenv import load_dotenv
-
 from langchain_core.documents import Document
-
 import tiktoken
 from docling_core.transforms.chunker.tokenizer.openai import OpenAITokenizer
 from docling.chunking import HybridChunker
 
 
 
+from docling.datamodel.settings import settings 
+settings.inference.compile_torch_models = False
 
 
+import os
+import time
+import pickle # Keep this for saving the final docs
+from dataclasses import dataclass, field
+
+import hashlib
+
+import psycopg2
+from psycopg2.extras import DictCursor
+from api.ingestion import ingest_pdfs
 
 
 
@@ -72,20 +80,7 @@ def get_directory_name(file_path: str) -> str:
 
 
 # ======================================================================================
-import os
-import time
-import pickle # Keep this for saving the final docs
-from dataclasses import dataclass, field
 
-import tiktoken
-from docling.document_converter import DocumentConverter
-from docling.chunking import HybridChunker
-from docling_core.transforms.chunker.tokenizer.openai import OpenAITokenizer
-from langchain_core.documents import Document
-import hashlib
-import sqlite3
-import psycopg2
-from psycopg2.extras import DictCursor
 
 my_postgres_pwd = os.getenv("POSTGRES_PWD")
 db_name = os.getenv("DB_NAME")
@@ -97,8 +92,6 @@ db_user = os.getenv("DB_USER")
 def ensure_chunker_initialized() -> None:
     """Initialize the shared Docling converter/chunker once using the same logic as the batch ingestion flow."""
     global _converter, _chunker
-    if _converter is not None and _chunker is not None:
-        return
 
     _converter = DocumentConverter()
     local_bpe_tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -133,7 +126,7 @@ def _process_single_file(file_path: str, folder_name: str) -> dict:
             port=5432,
             database=db_name,
             user=db_user,
-            password=safe_password  # Replace with your actual password
+            password=my_postgres_pwd  # Replace with your actual password
         )
         db_cursor = conn.cursor(cursor_factory=DictCursor)
 
@@ -178,32 +171,29 @@ def _process_single_file(file_path: str, folder_name: str) -> dict:
         conn.commit()
         db_cursor.close()
         conn.close()
+        if len(pdf_docs) == 0:
+            return {
+                "status": "no_new_chunks_to_ingest",
+                "num_chunks": 0,
+                "docs": [],
+                "skipped_chunks": skipped_chunks,
+            }
 
+        
+        ingestion_status = ingest_pdfs(pdf_docs, skipped_chunks=skipped_chunks)
         elapsed = time.perf_counter() - start
-        return {
-            "file_path": file_path,
-            "status": "success",
-            "num_chunks": len(pdf_docs),
-            "docs": pdf_docs,
-            "skipped_chunks": skipped_chunks,
-            "elapsed_seconds": elapsed,
-            "error": None,
-        }
+
+        ingestion_status["elapsed_seconds"] = elapsed
+
+        return ingestion_status
 
     except Exception as e:
         if conn:
             conn.rollback()
             conn.close()
         elapsed = time.perf_counter() - start
-        return {
-            "file_path": file_path,
-            "status": "failed",
-            "num_chunks": 0,
-            "docs": [],
-            "skipped_chunks": 0,
-            "elapsed_seconds": elapsed,
-            "error": str(e),
-        }
+        ingestion_status["elapsed_seconds"] = elapsed
+        return ingestion_status
 
 
 
