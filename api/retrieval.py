@@ -23,6 +23,7 @@ from langchain_community.utilities import SQLDatabase
 from semantic_router import Route
 from semantic_router.routers import SemanticRouter
 from semantic_router.encoders import HuggingFaceEncoder
+from api.rbac import get_allowed_collections_for_role
 
 # 1. Suppress library logging and warnings
 logging.getLogger("semantic_router").setLevel(logging.ERROR)
@@ -376,6 +377,7 @@ def smart_router_agent(
     question: str,
     session_id: str,
     chain: DirectConversationalRAG,
+    role: str ,
     verbose: bool = True,
 ) -> dict:
     if verbose:
@@ -431,9 +433,49 @@ def smart_router_agent(
             llm = ChatGoogleGenerativeAI(model="gemini-3-flash-preview")
             
             # Text-to-SQL generation
+
+
             write_query_chain = create_sql_query_chain(llm, db)
             raw_sql = write_query_chain.invoke({"question": question})
             sql_query = _clean_sql(raw_sql)
+
+            prompt_template = ChatPromptTemplate.from_messages([
+                            ("system", "you are an sql expert and a strict evaluator. You respond with table name based on sql_query. You respond with ONLY 'claims', 'maintenance_tickets'"),
+                            ("human", "Question: {sql_query}\n which table sql query is referring to? Respond with 'claims' or 'maintenance_tickets'.")
+                        ])
+
+            chain = prompt_template | llm | StrOutputParser()
+
+            res = chain.invoke({"query": sql_query})
+
+            table_name =  res.strip().lower() 
+
+            if table_name =='claims' and role not in ['billing_executive', 'admin']:
+            
+                allowed_str = ", ".join(get_allowed_collections_for_role(role)) if get_allowed_collections_for_role(role) else "your permitted sources"
+                restricted_answer = f"I don't have that information. As a {role}, you can access only your respective sources ({allowed_str})."
+                return {
+                                "route": "sql_rag",
+                                "answer": restricted_answer,
+                                "documents": [],
+                                "sql_query": sql_query,
+                                "sql_result": db_result,
+                                "row_count": 0,
+                                "confidence": confidence_score,
+                            }
+
+            if table_name =='maintenance_tickets' and role not in ['technician', 'admin']:
+                allowed_str = ", ".join(get_allowed_collections_for_role(role)) if get_allowed_collections_for_role(role) else "your permitted sources"
+                restricted_answer = f"I don't have that information. As a {role}, you can access only your respective sources ({allowed_str})."
+                return {
+                                "route": "sql_rag",
+                                "answer": restricted_answer,
+                                "documents": [],
+                                "sql_query": sql_query,
+                                "sql_result": db_result,
+                                "row_count": 0,
+                                "confidence": confidence_score,
+                            }
             
             if verbose:
                 print(f"[SQL RAG] Generated SQL Query: {sql_query}")
