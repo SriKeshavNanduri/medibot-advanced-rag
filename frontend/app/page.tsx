@@ -125,7 +125,8 @@ export default function MediAssistApp() {
 
       const data = await response.json();
       const answer = data.answer || data.response || 'No answer received.';
-      const citations = data.citations || data.source_nodes || [];
+      // Backend returns sources under the key 'sources'
+      const citations = data.sources || data.citations || data.source_nodes || [];
 
       setMessages((prev) => [
         ...prev,
@@ -359,9 +360,9 @@ export default function MediAssistApp() {
                                 Section: <span className="text-slate-300">{cite.section_title || cite.metadata?.section_title}</span>
                               </p>
                             )}
-                            {(cite.content || cite.page_content) && (
+                            {(cite.content || cite.page_content || cite.snippet) && (
                               <p className="text-slate-400 italic bg-slate-900/50 p-2 rounded border border-slate-800/40 line-clamp-3">
-                                "{cite.content || cite.page_content}"
+                                "{cite.content || cite.page_content || cite.snippet}"
                               </p>
                             )}
                           </div>
