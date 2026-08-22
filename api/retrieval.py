@@ -10,7 +10,10 @@ from dotenv import load_dotenv
 from qdrant_client.http import models as rest
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_qdrant import FastEmbedSparse, QdrantVectorStore, RetrievalMode
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from pydantic import BaseModel, Field
 from langchain_classic.chains import create_sql_query_chain
 from langchain_classic.retrievers import ContextualCompressionRetriever
 from langchain_classic.retrievers.document_compressors import CrossEncoderReranker
@@ -178,10 +181,11 @@ def get_postgres_session_history(session_id: str) -> PostgresChatMessageHistory:
 class DirectConversationalRAG:
     """Standard, runnable-free Conversational RAG pipeline."""
 
-    def __init__(self, compressed_retriever, llm: ChatGoogleGenerativeAI, with_history: bool = True):
+    def __init__(self, compressed_retriever, llm: ChatGoogleGenerativeAI, user_role: str, allowed_collections: list[str] | None = None):
         self.compressed_retriever = compressed_retriever
         self.llm = llm
-        self.with_history = with_history
+        self.user_role = user_role
+        self.allowed_collections = allowed_collections or []
         self.system_prompt_template = (
             "You are a helpful Medibot customer support assistant.\n"
             "Answer the customer's question using ONLY the information provided in the context below.\n"
@@ -193,8 +197,6 @@ class DirectConversationalRAG:
     def _retrieve(self, query: str, chat_hist: list) -> list:
         logger = logging.getLogger("medibot.retrieval")
         logger.info("[DB History Read] Retrieved raw chat history messages count: %d", len(chat_hist))
-        for idx, msg in enumerate(chat_hist):
-            logger.info("  History[%d] (%s): %s", idx, type(msg).__name__, getattr(msg, "content", str(msg)))
 
         search_query = query
         if chat_hist:
@@ -229,29 +231,78 @@ class DirectConversationalRAG:
             answer = str(content)
         return answer
 
-    def invoke(self, inputs: dict, config: dict | None = None) -> dict:
+
+    def _cross_check(self, answer: str, query: str) -> bool:
+        # Use Pydantic structured output for reliable boolean evaluation
+        class Evaluation(BaseModel):
+            is_valid: bool = Field(description="True if the answer fully addresses the user question, False otherwise.")
+
+        try:
+            structured_llm = self.llm.with_structured_output(Evaluation)
+            prompt = (
+                f"Evaluate whether the generated answer fully and accurately addresses the user's question.\n\n"
+                f"User Question: {query}\n"
+                f"Generated Answer: {answer}"
+            )
+            result = structured_llm.invoke(prompt)
+            if isinstance(result, Evaluation):
+                return result.is_valid
+            elif isinstance(result, dict):
+                return bool(result.get("is_valid", False))
+            return False
+        except Exception:
+            # Fallback to chain with StrOutputParser if structured output is unsupported by the model version
+            prompt_template = ChatPromptTemplate.from_messages([
+                ("system", "You are a strict evaluator. Respond with ONLY 'yes' or 'no'."),
+                ("human", "Question: {query}\nAnswer: {answer}\nDoes the answer fully address the question? Respond with 'yes' or 'no'.")
+            ])
+            chain = prompt_template | self.llm | StrOutputParser()
+            res = chain.invoke({"query": query, "answer": answer})
+            return res.strip().lower() == "yes"
+
+    def invoke_function(self, inputs: dict,) -> dict:
         query = inputs["input"]
 
         # Resolve chat history
-        if self.with_history and config and "configurable" in config:
-            session_id = config["configurable"].get("session_id")
-            history_mgr = get_postgres_session_history(session_id)
-            chat_hist = history_mgr.messages
-        else:
-            chat_hist = inputs.get("chat_history", [])
+
+        session_id = inputs.get("session_id")
+        history_mgr = get_postgres_session_history(session_id)
+        chat_hist = history_mgr.messages
+
+        if len(chat_hist)==0   :
+            chat_hist = []
 
         # 1. Retrieve
         docs = self._retrieve(query, chat_hist)
 
+        if len(docs) == 0:
+            allowed_str = ", ".join(self.allowed_collections) if self.allowed_collections else "your permitted sources"
+            answer = f"I don't have that information. As a {self.user_role}, you can access only your respective sources ({allowed_str})."
+            return {
+                "answer": answer,
+                "context": [],
+            }
+
         # 2. Answer
         answer = self._generate_answer(query, chat_hist, docs)
 
-        # 3. Handle Postgres history persistence if state wrapper is enabled
-        if self.with_history and config and "configurable" in config:
-            session_id = config["configurable"].get("session_id")
-            history_mgr = get_postgres_session_history(session_id)
-            history_mgr.add_user_message(query)
-            history_mgr.add_ai_message(answer)
+        #3. Cross checking if answer fulfills the user query, if not then return a default answer 
+        cross_check = self._cross_check(answer, query) 
+
+        if not cross_check:
+            allowed_str = ", ".join(self.allowed_collections) if self.allowed_collections else "your permitted sources"
+            answer = f"I don't have that information. As a {self.user_role}, you can access only your respective sources ({allowed_str})."
+            return {
+                "answer": answer,
+                "context": docs
+            }
+
+
+        # 4. Handle Postgres history persistence if state wrapper is enabled
+        
+        history_mgr = get_postgres_session_history(session_id)
+        history_mgr.add_user_message(query)
+        history_mgr.add_ai_message(answer)
 
         return {
             "answer": answer,
@@ -262,7 +313,6 @@ class DirectConversationalRAG:
 def setup_conversational_rag(
     user_role: str,
     allowed_collections: list[str] | None = None,
-    with_history: bool = True,
 ) -> DirectConversationalRAG:
     
     load_dotenv(os.path.join(_HERE, "creds.env"))
@@ -300,7 +350,8 @@ def setup_conversational_rag(
     return DirectConversationalRAG(
         compressed_retriever=compressed_retriever,
         llm=llm,
-        with_history=with_history
+        user_role=user_role,
+        allowed_collections=allowed_collections,
     )
 
 
@@ -325,7 +376,6 @@ def smart_router_agent(
     question: str,
     session_id: str,
     chain: DirectConversationalRAG,
-    chat_history=None,
     verbose: bool = True,
 ) -> dict:
     if verbose:
@@ -347,11 +397,8 @@ def smart_router_agent(
         print(f"[Router Decision] -> Detected Intent Route: {detected_route}")
 
     def qdrant_rag_path():
-        if chat_history is None:
-            config = {"configurable": {"session_id": session_id}}
-            result = chain.invoke({"input": question}, config=config)
-        else:
-            result = chain.invoke({"input": question, "chat_history": chat_history})
+        
+        result = chain.invoke_function({"input": question, "session_id": session_id} ) 
 
         documents = result.get("context") or []
 

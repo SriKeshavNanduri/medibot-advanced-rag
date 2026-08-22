@@ -57,7 +57,6 @@ def warmup() -> None:
         CHAIN_CACHE[role] = retrieval.setup_conversational_rag(
             user_role=role,
             allowed_collections=collections,
-            with_history=False,
         )
         logger.info(
             "chain ready: %-18s collections=%s (%.2fs)",
@@ -92,12 +91,10 @@ def answer_question(question: str, role: Role, session_key: str) -> dict:
     started = time.perf_counter()
     with _CHAT_SEMAPHORE:
         with open_history(session_key) as history:
-            prior = load_recent_messages(history, get_settings().history_max_turns)
             result = retrieval.smart_router_agent(
                 question=question,
                 session_id=session_key,
                 chain=chain,
-                chat_history=prior,
                 verbose=True,
             )
             # Runs for the qdrant_rag AND sql_rag branches alike -- the SQL path
