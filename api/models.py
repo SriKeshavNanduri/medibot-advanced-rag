@@ -63,7 +63,7 @@ class LoginRequest(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={
-            "examples": [{"username": "dr_house", "password": "doctor123", "role": "doctor"}]
+            "examples": [{"username": "dr_house", "password": "doctor123"}]
         },
     )
 
@@ -150,18 +150,6 @@ class ChatRequest(BaseModel):
             raise ValueError("question must not be blank")
         return value
 
-    # @field_validator("session_id", mode="before")
-    # @classmethod
-    # def _default_session_id(cls, value: Any) -> str:
-    #     """
-    #     Generates a uuid-timestamp based session_id if none or 'default' is provided.
-    #     """
-    #     if not value or value == "default" or not isinstance(value, str) or not value.strip():
-    #         ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    #         uid = uuid.uuid4().hex[:8]
-    #         return f"session_{ts}_{uid}"
-    #     return value.strip()
-
 
 class Source(BaseModel):
     """One reranked chunk, built from the metadata written by chunking.py."""
@@ -211,6 +199,7 @@ class ChatResponse(BaseModel):
     role: Role
     session_id: str
     sources: list[Source] = Field(default_factory=list)
+    dense_docs: list[Source] = Field(default_factory=list)
     sql: SqlSource | None = None
     router_confidence: float | None = None
     history_written: bool = Field(

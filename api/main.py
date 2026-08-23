@@ -304,10 +304,13 @@ def chat(payload: ChatRequest, user: CurrentUserDep) -> ChatResponse:
         sql = SqlSource(sql_query=result["sql_query"], row_count=result.get("row_count"))
 
     documents = result["documents"]
+    dense_docs = result.get("dense_docs", [])
+    source_dense_docs = [Source.from_document(d) for d in dense_docs]
 
     return ChatResponse(
         answer=result["answer"],
         route=RouteName(result["route"]),
+        dense_docs=source_dense_docs,
         role=user.role,
         session_id=payload.session_id,
         sources=[Source.from_document(d) for d in documents],
