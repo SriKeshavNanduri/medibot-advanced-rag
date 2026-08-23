@@ -97,22 +97,20 @@ def ingest_pdfs(pdf_docs, skipped_chunks = 0):
     # 2. Extract serialized document chunks
     try: 
         
-        # 3. Stream data pipeline to your native local network port 
+    # 3. Stream data pipeline to your native local network port 
         LOCAL_QDRANT_URL = os.getenv("LOCAL_QDRANT_URL")
         # print(f" Connecting to local standalone Qdrant at {LOCAL_QDRANT_URL}...")
         # print(f" Encoding chunks & building index for collection '{COLLECTION_NAME}'... (This may take a moment)")
 
         # Initiates automated schema config, batch embedding computation, and network upsertion.
-        vectorstore = QdrantVectorStore(
-            client=LOCAL_QDRANT_URL,
+        vectorstore = QdrantVectorStore.from_documents(
             documents=pdf_docs,
+            url=LOCAL_QDRANT_URL,
             embedding=dense_embeddings,
-            sparse_embedding=sparse_embeddings,
-            url=LOCAL_QDRANT_URL,      
+            sparse_embedding=sparse_embeddings,    
             collection_name=COLLECTION_NAME,
             retrieval_mode=RetrievalMode.HYBRID,
         )
-        vectorstore.add_documents(pdf_docs)
 
 
         logger.info(" Ingestion Complete! Data successfully vectorized and upserted into Qdrant.")

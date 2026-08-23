@@ -24,8 +24,9 @@ import hashlib
 
 import psycopg2
 from psycopg2.extras import DictCursor
-from api.ingestion import ingest_pdfs
 
+from api.ingestion import ingest_pdfs
+from api.rbac import get_access_based_on_collection  # noqa: E402,F401
 
 
 # =====================================
@@ -73,7 +74,7 @@ def get_source_document(chunk) -> str:
 
 # The collection -> roles mapping now lives in api/rbac.py so that the ingestion
 # path and the FastAPI service cannot drift apart. api.rbac has no heavy imports.
-from api.rbac import get_access_based_on_collection  # noqa: E402,F401
+
 
 def get_directory_name(file_path: str) -> str:
     return os.path.basename(os.path.dirname(file_path))
@@ -198,15 +199,16 @@ def _process_single_file(file_path: str, folder_name: str) -> dict:
 
 
 # Renamed function to reflect sequential execution
-def chunking_of_pdfs_sequential(folder_names: list[str], save_path: str | None = None):
+def chunking_and_ingestion_of_pdfs_sequential(folder_names: list[str], save_path: str | None = None):
     """
-    Processes PDF files sequentially for chunking.
+    Processes PDF files sequentially for chunking and ingestion.
     max_workers defaults to os.cpu_count() if not specified.
     """
     current_dir = os.getcwd()
+    root_dir = os.path.dirname(current_dir) if os.path.basename(current_dir) == "api" else current_dir
     all_file_paths = []
     for folder_name in folder_names:
-        data_dir = os.path.join(current_dir, "mediassist_data", folder_name)
+        data_dir = os.path.join(root_dir, "mediassist_data", folder_name)
         if os.path.isdir(data_dir):
             files = os.listdir(data_dir)
             file_paths = [os.path.join(data_dir, f) for f in files]
@@ -242,7 +244,10 @@ def chunking_of_pdfs_sequential(folder_names: list[str], save_path: str | None =
             result = _process_single_file(path, get_directory_name(path))
             results_summary.append(result)
 
-            if result["status"] == "success":
+            if result["status"] == "no_new_chunks_to_ingest":
+                print(f"[{completed}/{len(all_file_paths)}] SKIP {os.path.basename(path)}: No new chunks to ingest.")
+
+            elif result["status"] == "successfully_ingested":
                 all_docs.extend(result["docs"])
                 skipped_info = ""
                 if result.get("skipped_chunks", 0) > 0:
@@ -265,7 +270,7 @@ def chunking_of_pdfs_sequential(folder_names: list[str], save_path: str | None =
             })
 
     # Summary
-    succeeded = sum(1 for r in results_summary if r["status"] == "success")
+    succeeded = sum(1 for r in results_summary if r["status"] == "successfully_ingested")
     failed = len(results_summary) - succeeded
     print("---" * 30)
     print(f"Done. {succeeded} succeeded, {failed} failed. Total chunks: {len(all_docs)}")
@@ -278,13 +283,13 @@ def chunking_of_pdfs_sequential(folder_names: list[str], save_path: str | None =
     return all_docs, results_summary
     
 # Removed _init_worker as it's no longer needed for sequential processing
-# The global _converter and _chunker are now initialized directly in chunking_of_pdfs_sequential
+# The global _converter and _chunker are now initialized directly in chunking_and_ingestion_of_pdfs_sequential
 _converter = None
 _chunker = None
 
 
 if __name__ == "__main__":
-    docs, summary = chunking_of_pdfs_sequential( # Call the sequential function
+    docs, summary = chunking_and_ingestion_of_pdfs_sequential( # Call the sequential function
         ["general", "clinical", "nursing", "equipment", "billing"], # Example with multiple folders
-        save_path="policies_chunks_all_files.pkl",
+        save_path="policies_chunks_all_files_2.pkl",
     )
