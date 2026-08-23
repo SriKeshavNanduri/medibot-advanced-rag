@@ -23,7 +23,7 @@ from langchain_community.utilities import SQLDatabase
 from semantic_router import Route
 from semantic_router.routers import SemanticRouter
 from semantic_router.encoders import HuggingFaceEncoder
-from api.rbac import get_allowed_collections_for_role
+from api.rbac import get_collections_for_role
 
 # 1. Suppress library logging and warnings
 logging.getLogger("semantic_router").setLevel(logging.ERROR)
@@ -43,7 +43,7 @@ cross_encoder = HuggingFaceCrossEncoder(
 
 reranker = CrossEncoderReranker(
     model=cross_encoder,
-    top_n=3
+    top_n=10
 )
 
 sql_route = Route(
@@ -170,6 +170,20 @@ def get_vectorstore() -> QdrantVectorStore:
                 )
     return _VECTORSTORE
 
+def get_vectorstore_dense() -> QdrantVectorStore:
+    global _VECTORSTORE
+    if _VECTORSTORE is None:
+        with _VECTORSTORE_LOCK:
+            if _VECTORSTORE is None:
+                dense_embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2")
+                _VECTORSTORE = QdrantVectorStore.from_existing_collection(
+                    embedding=dense_embeddings,
+                    url=os.getenv("LOCAL_QDRANT_URL"),
+                    collection_name=os.getenv("COLLECTION_NAME"),
+                    retrieval_mode=RetrievalMode.DENSE,
+                )
+    return _VECTORSTORE
+
 
 def get_postgres_session_history(session_id: str) -> PostgresChatMessageHistory:
     return PostgresChatMessageHistory(
@@ -182,8 +196,9 @@ def get_postgres_session_history(session_id: str) -> PostgresChatMessageHistory:
 class DirectConversationalRAG:
     """Standard, runnable-free Conversational RAG pipeline."""
 
-    def __init__(self, compressed_retriever, llm: ChatGoogleGenerativeAI, user_role: str, allowed_collections: list[str] | None = None):
+    def __init__(self, compressed_retriever,dense_retriever, llm: ChatGoogleGenerativeAI, user_role: str, allowed_collections: list[str] | None = None):
         self.compressed_retriever = compressed_retriever
+        self.dense_retriever = dense_retriever
         self.llm = llm
         self.user_role = user_role
         self.allowed_collections = allowed_collections or []
@@ -206,14 +221,34 @@ class DirectConversationalRAG:
                 role_label = "User" if type(msg).__name__ == "HumanMessage" else "Assistant"
                 recent_turns.append(f"{role_label}: {getattr(msg, 'content', '')}")
             history_context_str = " ".join(recent_turns)
-            search_query = f"{history_context_str} Current Question: {query}"
+
+            def context_continuation(history_context_str: str, query: str) -> str:
+                prompt = "You are a helpful assistant. " \
+                "Given the following chat history and a new user question, determine if the chat history and the user query are still in the same context or the user query is a new topic. " \
+                "Respond with 'yes' or 'no'.\n\nChat History:\n{history_context_str}\n\nNew Question: {query}\n is the user still in the same context? " \
+                "Respond with 'yes' or 'no'."
+
+                chain = ChatPromptTemplate.from_template(prompt) | self.llm | StrOutputParser()
+                response = chain.invoke({"history_context_str": history_context_str, "query": query})
+                return response.strip().lower() == "yes"
+                
+
+            if not context_continuation(history_context_str, query):
+                search_query = f" Current Question: {query}"
+            else:
+                search_query = f"Context: {history_context_str} Current Question: {query}"
+
             logger.info("[Retrieval] Combined search query with chat history context: '%s'", search_query)
         else:
             logger.info("[Retrieval] Executing hybrid search for query: '%s'", query)
 
         docs = self.compressed_retriever.invoke(search_query)
-        # logger.info("[Retrieval] Retrieved documents before score filtering %s", docs)
-        return docs
+
+        dense_docs = self.dense_retriever.invoke(search_query)
+
+        logger.info("[Retrieval] Retrieved documents before score filtering %s", docs)
+        logger.info("[Retrieval] Retrieved dense documents %s", dense_docs)
+        return docs, dense_docs
 
     def _generate_answer(self, query: str, chat_hist: list, docs: list) -> str:
         # Document stuffing logic
@@ -226,10 +261,14 @@ class DirectConversationalRAG:
 
         response = self.llm.invoke(messages)
         content = response.content
+
         if isinstance(content, list):
             answer = "".join(item.get("text", "") for item in content if isinstance(item, dict))
         else:
             answer = str(content)
+        
+        logger = logging.getLogger("medibot.retrieval")
+        logger.info("[Answer Generation] Generated answer: '%s'", answer)
         return answer
 
 
@@ -246,11 +285,16 @@ class DirectConversationalRAG:
                 f"Generated Answer: {answer}"
             )
             result = structured_llm.invoke(prompt)
+
+            logger = logging.getLogger("medibot.retrieval")
+            logger.info("[Cross-Check] Evaluation result: %s", result)
+
             if isinstance(result, Evaluation):
                 return result.is_valid
             elif isinstance(result, dict):
                 return bool(result.get("is_valid", False))
             return False
+        
         except Exception:
             # Fallback to chain with StrOutputParser if structured output is unsupported by the model version
             prompt_template = ChatPromptTemplate.from_messages([
@@ -259,6 +303,8 @@ class DirectConversationalRAG:
             ])
             chain = prompt_template | self.llm | StrOutputParser()
             res = chain.invoke({"query": query, "answer": answer})
+            logger = logging.getLogger("medibot.retrieval")
+            logger.info("[Cross-Check Fallback] Evaluation result: %s", res)
             return res.strip().lower() == "yes"
 
     def invoke_function(self, inputs: dict,) -> dict:
@@ -274,14 +320,17 @@ class DirectConversationalRAG:
             chat_hist = []
 
         # 1. Retrieve
-        docs = self._retrieve(query, chat_hist)
+        docs, dense_docs = self._retrieve(query, chat_hist)
 
-        if len(docs) == 0:
+        if len(docs) == 0 :
             allowed_str = ", ".join(self.allowed_collections) if self.allowed_collections else "your permitted sources"
             answer = f"I don't have that information. As a {self.user_role}, you can access only your respective sources ({allowed_str})."
+            logger = logging.getLogger("medibot.retrieval")
+            logger.info("[Answer Generation] Generated answer: '%s'", answer)
             return {
                 "answer": answer,
                 "context": [],
+                "dense_docs": dense_docs
             }
 
         # 2. Answer
@@ -293,9 +342,12 @@ class DirectConversationalRAG:
         if not cross_check:
             allowed_str = ", ".join(self.allowed_collections) if self.allowed_collections else "your permitted sources"
             answer = f"I don't have that information. As a {self.user_role}, you can access only your respective sources ({allowed_str})."
+            logger = logging.getLogger("medibot.retrieval")
+            logger.info("[Answer Generation] Generated answer: '%s'", answer)
             return {
                 "answer": answer,
-                "context": docs
+                "context": docs,
+                "dense_docs": dense_docs
             }
 
 
@@ -307,7 +359,8 @@ class DirectConversationalRAG:
 
         return {
             "answer": answer,
-            "context": docs
+            "context": docs , 
+            "dense_docs" : dense_docs 
         }
 
 
@@ -321,6 +374,8 @@ def setup_conversational_rag(
         os.environ["GOOGLE_API_KEY"] = os.environ["GEMINI_API_KEY"]
 
     vectorstore = get_vectorstore()
+
+    vectorestore_dense = get_vectorstore_dense()
 
     must_conditions = [
         rest.FieldCondition(
@@ -338,7 +393,11 @@ def setup_conversational_rag(
     qdrant_filter = rest.Filter(must=must_conditions)
 
     hybrid_retriever = vectorstore.as_retriever(
-        search_kwargs={"k": 10, "filter": qdrant_filter}
+        search_kwargs={"k": 25, "filter": qdrant_filter}
+    )
+
+    retriever_dense = vectorestore_dense.as_retriever(
+        search_kwargs={"k": 5, "filter": qdrant_filter}
     )
 
     compressed_retriever = ContextualCompressionRetriever(
@@ -350,6 +409,7 @@ def setup_conversational_rag(
 
     return DirectConversationalRAG(
         compressed_retriever=compressed_retriever,
+        dense_retriever=retriever_dense,
         llm=llm,
         user_role=user_role,
         allowed_collections=allowed_collections,
@@ -403,6 +463,7 @@ def smart_router_agent(
         result = chain.invoke_function({"input": question, "session_id": session_id} ) 
 
         documents = result.get("context") or []
+        dense_docs = result.get("dense_docs") or []
 
         if verbose:
             print(f"Bot: {result['answer']}")
@@ -416,6 +477,7 @@ def smart_router_agent(
             "route": "qdrant_rag",
             "answer": result["answer"],
             "documents": documents,
+            "dense_docs": dense_docs,
             "sql_query": None,
             "sql_result": None,
             "row_count": None,
@@ -425,7 +487,7 @@ def smart_router_agent(
     if detected_route == "qdrant_rag":
         return qdrant_rag_path()
 
-    if detected_route == "sql_rag" and confidence_score is not None and confidence_score >= 0.55:
+    if detected_route == "sql_rag" and confidence_score is not None :
         try:
             if verbose:
                 print("Directing query to SQL RAG pipeline...")
@@ -446,18 +508,19 @@ def smart_router_agent(
 
             chain = prompt_template | llm | StrOutputParser()
 
-            res = chain.invoke({"query": sql_query})
+            res = chain.invoke({"sql_query": sql_query})
 
             table_name =  res.strip().lower() 
 
             if table_name =='claims' and role not in ['billing_executive', 'admin']:
             
-                allowed_str = ", ".join(get_allowed_collections_for_role(role)) if get_allowed_collections_for_role(role) else "your permitted sources"
+                allowed_str = ", ".join(get_collections_for_role(role)) if get_collections_for_role(role) else "your permitted sources"
                 restricted_answer = f"I don't have that information. As a {role}, you can access only your respective sources ({allowed_str})."
                 return {
                                 "route": "sql_rag",
                                 "answer": restricted_answer,
                                 "documents": [],
+                                "dense_docs": [],
                                 "sql_query": sql_query,
                                 "sql_result": db_result,
                                 "row_count": 0,
@@ -465,12 +528,13 @@ def smart_router_agent(
                             }
 
             if table_name =='maintenance_tickets' and role not in ['technician', 'admin']:
-                allowed_str = ", ".join(get_allowed_collections_for_role(role)) if get_allowed_collections_for_role(role) else "your permitted sources"
+                allowed_str = ", ".join(get_collections_for_role(role)) if get_collections_for_role(role) else "your permitted sources"
                 restricted_answer = f"I don't have that information. As a {role}, you can access only your respective sources ({allowed_str})."
                 return {
                                 "route": "sql_rag",
                                 "answer": restricted_answer,
                                 "documents": [],
+                                "dense_docs": [],
                                 "sql_query": sql_query,
                                 "sql_result": db_result,
                                 "row_count": 0,
@@ -506,6 +570,7 @@ def smart_router_agent(
                 "route": "sql_rag",
                 "answer": final_answer,
                 "documents": [],
+                "dense_docs": [],
                 "sql_query": sql_query,
                 "sql_result": db_result,
                 "row_count": _row_count(db_result),

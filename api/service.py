@@ -96,6 +96,7 @@ def answer_question(question: str, role: Role, session_key: str) -> dict:
                 session_id=session_key,
                 chain=chain,
                 verbose=True,
+                role=role,
             )
             # Runs for the qdrant_rag AND sql_rag branches alike -- the SQL path
             # previously bypassed the chain entirely and never wrote anything.
